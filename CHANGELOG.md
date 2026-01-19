@@ -4,7 +4,7 @@
 
 - N/A.
 
-## 0.1.0 — 2025-12-30
+## 0.1.0 — 2026-01-19
 
 - ElevenLabs TTS client with retry/backoff, timeouts, and voice listing.
 - Async/await streaming + fetch synthesize APIs with output-format handling (mp3/pcm).
