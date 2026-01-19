@@ -48,7 +48,10 @@ import Testing
             fileStreamClose: { _ in closeCalled.set(); return noErr },
             queueNewOutput: { _, _, _, _, _, _, _ in noErr },
             queueAddPropertyListener: { _, _, _, _ in noErr },
-            queueAllocateBuffer: { _, _, _ in noErr },
+            queueAllocateBuffer: { _, _, outBuffer in
+                outBuffer.pointee = nil
+                return noErr
+            },
             queueEnqueueBuffer: { _, _, _, _ in noErr },
             queueStart: { _, _ in noErr },
             queueStop: { _, _ in noErr },
@@ -185,6 +188,80 @@ import Testing
         #expect(enqueueCalled.get())
         #expect(startCalled.get())
         #expect(stopCalled.get())
+    }
+
+    @Test func finishUnblocksPendingBufferWaiters() {
+        let done = DispatchSemaphore(value: 0)
+
+        let audio = AudioToolboxClient(
+            fileStreamOpen: { _, _, _, _, outStream in
+                outStream.pointee = OpaquePointer(bitPattern: 0x1)
+                return noErr
+            },
+            fileStreamParseBytes: { _, _, _, _ in noErr },
+            fileStreamGetPropertyInfo: { _, _, outSize, outWritable in
+                outSize.pointee = 0
+                outWritable.pointee = false
+                return noErr
+            },
+            fileStreamGetProperty: { _, _, _, _ in noErr },
+            fileStreamClose: { _ in noErr },
+            queueNewOutput: { _, _, _, _, _, _, outQueue in
+                outQueue.pointee = OpaquePointer(bitPattern: 0x2)
+                return noErr
+            },
+            queueAddPropertyListener: { _, _, _, _ in noErr },
+            queueAllocateBuffer: { _, _, _ in noErr },
+            queueEnqueueBuffer: { _, _, _, _ in noErr },
+            queueStart: { _, _ in noErr },
+            queueStop: { _, _ in noErr },
+            queueDispose: { _, _ in noErr },
+            queueSetProperty: { _, _, _, _ in noErr },
+            queueGetCurrentTime: { _, _, _, _ in noErr },
+            queueGetProperty: { _, _, _, _ in noErr }
+        )
+
+        let playback = StreamingAudioPlayback(
+            logger: Logger(subsystem: "test", category: "stream"),
+            audio: audio,
+            scheduleParseWork: { $0() }
+        )
+
+        var format = AudioStreamBasicDescription()
+        format.mSampleRate = 44100
+        playback.setupQueueIfNeeded(format)
+
+        let bytes = [UInt8](repeating: 0x11, count: 16)
+        bytes.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            for _ in 0..<3 {
+                playback.handlePackets(
+                    numberBytes: UInt32(raw.count),
+                    numberPackets: 1,
+                    inputData: base,
+                    packetDescriptions: nil
+                )
+            }
+        }
+
+        DispatchQueue.global().async {
+            bytes.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                playback.handlePackets(
+                    numberBytes: UInt32(raw.count),
+                    numberPackets: 1,
+                    inputData: base,
+                    packetDescriptions: nil
+                )
+            }
+            done.signal()
+        }
+
+        Thread.sleep(forTimeInterval: 0.05)
+        playback.finish(StreamingPlaybackResult(finished: false, interruptedAt: nil))
+
+        let result = done.wait(timeout: .now() + 1)
+        #expect(result == .success)
     }
 
     @Test func stopReturnsNilWhenSampleTimeIsNaN() {

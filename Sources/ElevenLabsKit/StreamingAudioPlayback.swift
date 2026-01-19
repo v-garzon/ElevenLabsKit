@@ -15,6 +15,8 @@ final class StreamingAudioPlayback: @unchecked Sendable {
 
     private var continuation: CheckedContinuation<StreamingPlaybackResult, Never>?
     private var finished = false
+    private var tearingDown = false
+    private var bufferWaits = 0
 
     private var audioFileStream: AudioFileStreamID?
     private var audioQueue: AudioQueueRef?
@@ -120,6 +122,7 @@ final class StreamingAudioPlayback: @unchecked Sendable {
             continuation = nil
         } else {
             finished = true
+            tearingDown = true
             continuation = self.continuation
             self.continuation = nil
         }
@@ -130,6 +133,7 @@ final class StreamingAudioPlayback: @unchecked Sendable {
     }
 
     private func teardown() {
+        releaseBufferWaiters()
         if let audioQueue {
             _ = audio.queueDispose(audioQueue, true)
             self.audioQueue = nil
@@ -143,6 +147,35 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         bufferLock.unlock()
         currentBuffer = nil
         currentPacketDescs.removeAll()
+    }
+
+    private func releaseBufferWaiters() {
+        let waits = drainBufferWaits()
+        guard waits > 0 else { return }
+        for _ in 0..<waits {
+            bufferSemaphore.signal()
+        }
+    }
+
+    private func recordBufferWait() {
+        lock.lock()
+        bufferWaits += 1
+        lock.unlock()
+    }
+
+    private func drainBufferWaits() -> Int {
+        lock.lock()
+        let waits = bufferWaits
+        bufferWaits = 0
+        lock.unlock()
+        return waits
+    }
+
+    private func isTearingDown() -> Bool {
+        lock.lock()
+        let value = tearingDown
+        lock.unlock()
+        return value
     }
 
     func setupQueueIfNeeded(_ asbd: AudioStreamBasicDescription) {
@@ -212,6 +245,7 @@ final class StreamingAudioPlayback: @unchecked Sendable {
     }
 
     private func enqueueCurrentBuffer(flushOnly: Bool = false) {
+        guard !isTearingDown() else { return }
         guard let audioQueue, let buffer = currentBuffer else { return }
         guard currentBufferSize > 0 else { return }
 
@@ -237,11 +271,15 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         currentBufferSize = 0
         currentPacketDescs.removeAll(keepingCapacity: true)
         if !flushOnly {
+            guard !isTearingDown() else { return }
             bufferLock.lock()
             var next = availableBuffers.popLast()
             bufferLock.unlock()
             if next == nil {
+                guard !isTearingDown() else { return }
+                recordBufferWait()
                 bufferSemaphore.wait()
+                guard !isTearingDown() else { return }
                 bufferLock.lock()
                 next = availableBuffers.popLast()
                 bufferLock.unlock()
@@ -256,6 +294,9 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         inputData: UnsafeRawPointer,
         packetDescriptions: UnsafeMutablePointer<AudioStreamPacketDescription>?
     ) {
+        if isTearingDown() {
+            return
+        }
         if audioQueue == nil, let format = audioFormat {
             setupQueueIfNeeded(format)
         }
@@ -269,7 +310,10 @@ final class StreamingAudioPlayback: @unchecked Sendable {
             currentBuffer = availableBuffers.popLast()
             bufferLock.unlock()
             if currentBuffer == nil {
+                guard !isTearingDown() else { return }
+                recordBufferWait()
                 bufferSemaphore.wait()
+                guard !isTearingDown() else { return }
                 bufferLock.lock()
                 currentBuffer = availableBuffers.popLast()
                 bufferLock.unlock()
