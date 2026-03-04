@@ -1,5 +1,5 @@
 import AudioToolbox
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
 import OSLog
 
@@ -506,14 +506,11 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         // Upper bound: 4096 is safe for MP3 (max ~1441 bytes), 2048 fallback is fine too.
         let effectiveMaxPacketSize = maxPacketSize > 0 ? Int(maxPacketSize) : 4096
 
-        guard let compressedBuffer = AVAudioCompressedBuffer(
+        let compressedBuffer = AVAudioCompressedBuffer(
             format: converter.inputFormat,
             packetCapacity: AVAudioPacketCount(numberPackets),
             maximumPacketSize: effectiveMaxPacketSize
-        ) else {
-            logger.error("talk player node: failed to allocate compressed buffer")
-            return
-        }
+        )
 
         // Copy compressed bytes into the buffer.
         compressedBuffer.byteLength = numberBytes
@@ -551,11 +548,15 @@ final class StreamingAudioPlayback: @unchecked Sendable {
 
         // Decode.  We provide all input in one shot via the input block.
         // The block signals .noDataNow on the second call to stop the converter loop.
-        var inputProvided = false
+        // Use a reference-type wrapper so the Sendable closure can mutate the flag
+        // without a compiler warning. The converter calls this block synchronously
+        // on the same thread — there is no actual concurrency here.
+        final class InputGate: @unchecked Sendable { var provided = false }
+        let gate = InputGate()
         var conversionError: NSError?
         let status = converter.convert(to: outputBuffer, error: &conversionError) { _, outStatus in
-            if !inputProvided {
-                inputProvided = true
+            if !gate.provided {
+                gate.provided = true
                 outStatus.pointee = .haveData
                 return compressedBuffer
             }
