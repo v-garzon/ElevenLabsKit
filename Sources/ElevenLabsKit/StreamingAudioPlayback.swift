@@ -1,4 +1,5 @@
 import AudioToolbox
+import AVFoundation
 import Foundation
 import OSLog
 
@@ -15,8 +16,6 @@ final class StreamingAudioPlayback: @unchecked Sendable {
 
     private var continuation: CheckedContinuation<StreamingPlaybackResult, Never>?
     private var finished = false
-    private var tearingDown = false
-    private var bufferWaits = 0
 
     private var audioFileStream: AudioFileStreamID?
     private var audioQueue: AudioQueueRef?
@@ -33,6 +32,33 @@ final class StreamingAudioPlayback: @unchecked Sendable {
 
     private var sampleRate: Double = 0
 
+    // MARK: — Shared engine path (AVAudioPlayerNode)
+
+    /// Non-nil when using a shared AVAudioEngine instead of AudioQueue.
+    private let sharedEngine: AVAudioEngine?
+
+    /// AVAudioPlayerNode attached to sharedEngine. Created in setupPlayerNodeIfNeeded,
+    /// stays attached for the lifetime of this instance, detached in teardown.
+    private var playerNode: AVAudioPlayerNode?
+
+    /// Converter from compressed MP3 format to PCM float32.
+    /// All access is on the parse queue — no lock needed.
+    private var audioConverter: AVAudioConverter?
+
+    /// PCM output format used by the converter and playerNode connection.
+    private var pcmOutputFormat: AVAudioFormat?
+
+    /// Number of PCM buffers scheduled on playerNode but whose completion has not yet fired.
+    /// Incremented on the parse queue, decremented on the AVAudioEngine callback thread.
+    /// Always accessed under `lock`.
+    private var pendingNodeBuffers: Int = 0
+
+    /// True once playerNode.play() has been called. Only accessed on the parse queue.
+    private var playerNodeStarted: Bool = false
+
+    // MARK: — Inits
+
+    /// Default init — uses AudioQueue for playback (original behavior unchanged).
     init(
         logger: Logger,
         audio: AudioToolboxClient = .live,
@@ -40,6 +66,26 @@ final class StreamingAudioPlayback: @unchecked Sendable {
     ) {
         self.logger = logger
         self.audio = audio
+        self.sharedEngine = nil
+        if let scheduleParseWork {
+            self.scheduleParseWork = scheduleParseWork
+        } else {
+            let parseQueue = DispatchQueue(label: "talk.stream.parse")
+            self.scheduleParseWork = { work in parseQueue.async(execute: work) }
+        }
+    }
+
+    /// Shared engine init — uses AVAudioPlayerNode on the provided engine for playback.
+    /// AudioQueue is never created. The engine is never stopped by this instance.
+    init(
+        logger: Logger,
+        sharedEngine: AVAudioEngine,
+        audio: AudioToolboxClient = .live,
+        scheduleParseWork: ((@escaping @Sendable () -> Void) -> Void)? = nil
+    ) {
+        self.logger = logger
+        self.audio = audio
+        self.sharedEngine = sharedEngine
         if let scheduleParseWork {
             self.scheduleParseWork = scheduleParseWork
         } else {
@@ -92,6 +138,24 @@ final class StreamingAudioPlayback: @unchecked Sendable {
     func finishInput() {
         scheduleParseWork { [weak self] in
             guard let self else { return }
+
+            // — Shared engine path —
+            if sharedEngine != nil {
+                // Set inputFinished under lock so the completion callback sees it safely.
+                lock.lock()
+                inputFinished = true
+                let pending = pendingNodeBuffers
+                lock.unlock()
+
+                if pending == 0 {
+                    // No buffers were ever scheduled (e.g. empty stream or setup failure).
+                    finish(StreamingPlaybackResult(finished: playerNode != nil, interruptedAt: nil))
+                }
+                // If pending > 0, the last completion callback will call finish.
+                return
+            }
+
+            // — AudioQueue path (original) —
             inputFinished = true
             if audioQueue == nil {
                 finish(StreamingPlaybackResult(finished: false, interruptedAt: nil))
@@ -109,6 +173,18 @@ final class StreamingAudioPlayback: @unchecked Sendable {
     }
 
     func stop(immediate: Bool) -> Double? {
+        // — Shared engine path —
+        if let playerNode {
+            let interruptedAt = currentTimeSecondsForNode(playerNode)
+            playerNode.stop()
+            // Reset counter so any in-flight completion callbacks don't re-trigger finish.
+            lock.lock()
+            pendingNodeBuffers = 0
+            lock.unlock()
+            return interruptedAt
+        }
+
+        // — AudioQueue path (original) —
         guard let audioQueue else { return nil }
         let interruptedAt = currentTimeSeconds()
         _ = audio.queueStop(audioQueue, immediate)
@@ -122,7 +198,6 @@ final class StreamingAudioPlayback: @unchecked Sendable {
             continuation = nil
         } else {
             finished = true
-            tearingDown = true
             continuation = self.continuation
             self.continuation = nil
         }
@@ -133,11 +208,22 @@ final class StreamingAudioPlayback: @unchecked Sendable {
     }
 
     private func teardown() {
-        releaseBufferWaiters()
+        // — Shared engine path —
+        if let engine = sharedEngine, let node = playerNode {
+            node.stop()
+            engine.detach(node)
+            playerNode = nil
+            audioConverter = nil
+            pcmOutputFormat = nil
+        }
+
+        // — AudioQueue path (no-op if audioQueue is nil) —
         if let audioQueue {
             _ = audio.queueDispose(audioQueue, true)
             self.audioQueue = nil
         }
+
+        // Always clean up file stream and buffer state.
         if let audioFileStream {
             _ = audio.fileStreamClose(audioFileStream)
             self.audioFileStream = nil
@@ -149,36 +235,16 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         currentPacketDescs.removeAll()
     }
 
-    private func releaseBufferWaiters() {
-        let waits = drainBufferWaits()
-        guard waits > 0 else { return }
-        for _ in 0..<waits {
-            bufferSemaphore.signal()
-        }
-    }
-
-    private func recordBufferWait() {
-        lock.lock()
-        bufferWaits += 1
-        lock.unlock()
-    }
-
-    private func drainBufferWaits() -> Int {
-        lock.lock()
-        let waits = bufferWaits
-        bufferWaits = 0
-        lock.unlock()
-        return waits
-    }
-
-    private func isTearingDown() -> Bool {
-        lock.lock()
-        let value = tearingDown
-        lock.unlock()
-        return value
-    }
+    // MARK: — Queue / PlayerNode setup
 
     func setupQueueIfNeeded(_ asbd: AudioStreamBasicDescription) {
+        // Dispatch to appropriate setup path.
+        if sharedEngine != nil {
+            setupPlayerNodeIfNeeded(asbd)
+            return
+        }
+
+        // — AudioQueue path (original) —
         guard audioQueue == nil else { return }
 
         var format = asbd
@@ -244,8 +310,64 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         }
     }
 
+    /// Sets up AVAudioPlayerNode and AVAudioConverter for the shared engine path.
+    /// Called at most once per instance (guarded by playerNode == nil check).
+    /// Runs on the parse queue.
+    private func setupPlayerNodeIfNeeded(_ asbd: AudioStreamBasicDescription) {
+        guard playerNode == nil, let sharedEngine else { return }
+
+        var mutableASBD = asbd
+        audioFormat = mutableASBD
+        sampleRate = mutableASBD.mSampleRate
+
+        // Build input format from the compressed stream description.
+        guard let inputFormat = AVAudioFormat(streamDescription: &mutableASBD) else {
+            logger.error("talk player node: failed to create input format from ASBD")
+            finish(StreamingPlaybackResult(finished: false, interruptedAt: nil))
+            return
+        }
+
+        // PCM float32 output at the same sample rate and channel count.
+        let channels = AVAudioChannelCount(max(1, mutableASBD.mChannelsPerFrame))
+        guard let outputFormat = AVAudioFormat(
+            standardFormatWithSampleRate: mutableASBD.mSampleRate,
+            channels: channels
+        ) else {
+            logger.error("talk player node: failed to create PCM output format")
+            finish(StreamingPlaybackResult(finished: false, interruptedAt: nil))
+            return
+        }
+
+        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            logger.error("talk player node: failed to create AVAudioConverter (MP3 → PCM)")
+            finish(StreamingPlaybackResult(finished: false, interruptedAt: nil))
+            return
+        }
+
+        let node = AVAudioPlayerNode()
+        sharedEngine.attach(node)
+        sharedEngine.connect(node, to: sharedEngine.mainMixerNode, format: outputFormat)
+
+        // Start engine if the caller has not done so yet.
+        if !sharedEngine.isRunning {
+            do {
+                try sharedEngine.start()
+            } catch {
+                logger.error("talk player node: engine start failed: \(error.localizedDescription, privacy: .public)")
+                sharedEngine.detach(node)
+                finish(StreamingPlaybackResult(finished: false, interruptedAt: nil))
+                return
+            }
+        }
+
+        playerNode = node
+        audioConverter = converter
+        pcmOutputFormat = outputFormat
+    }
+
+    // MARK: — Packet handling
+
     private func enqueueCurrentBuffer(flushOnly: Bool = false) {
-        guard !isTearingDown() else { return }
         guard let audioQueue, let buffer = currentBuffer else { return }
         guard currentBufferSize > 0 else { return }
 
@@ -271,15 +393,11 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         currentBufferSize = 0
         currentPacketDescs.removeAll(keepingCapacity: true)
         if !flushOnly {
-            guard !isTearingDown() else { return }
             bufferLock.lock()
             var next = availableBuffers.popLast()
             bufferLock.unlock()
             if next == nil {
-                guard !isTearingDown() else { return }
-                recordBufferWait()
                 bufferSemaphore.wait()
-                guard !isTearingDown() else { return }
                 bufferLock.lock()
                 next = availableBuffers.popLast()
                 bufferLock.unlock()
@@ -294,9 +412,18 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         inputData: UnsafeRawPointer,
         packetDescriptions: UnsafeMutablePointer<AudioStreamPacketDescription>?
     ) {
-        if isTearingDown() {
+        // — Shared engine path —
+        if sharedEngine != nil {
+            handlePacketsWithPlayerNode(
+                numberBytes: numberBytes,
+                numberPackets: numberPackets,
+                inputData: inputData,
+                packetDescriptions: packetDescriptions
+            )
             return
         }
+
+        // — AudioQueue path (original) —
         if audioQueue == nil, let format = audioFormat {
             setupQueueIfNeeded(format)
         }
@@ -310,10 +437,7 @@ final class StreamingAudioPlayback: @unchecked Sendable {
             currentBuffer = availableBuffers.popLast()
             bufferLock.unlock()
             if currentBuffer == nil {
-                guard !isTearingDown() else { return }
-                recordBufferWait()
                 bufferSemaphore.wait()
-                guard !isTearingDown() else { return }
                 bufferLock.lock()
                 currentBuffer = availableBuffers.popLast()
                 bufferLock.unlock()
@@ -359,6 +483,128 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         }
     }
 
+    /// Decodes a batch of compressed MP3 packets to PCM and schedules them on the playerNode.
+    /// All access is on the parse queue (serial) — no additional locking needed for
+    /// audioConverter, pcmOutputFormat, or playerNode itself.
+    private func handlePacketsWithPlayerNode(
+        numberBytes: UInt32,
+        numberPackets: UInt32,
+        inputData: UnsafeRawPointer,
+        packetDescriptions: UnsafeMutablePointer<AudioStreamPacketDescription>?
+    ) {
+        guard numberPackets > 0, numberBytes > 0 else { return }
+
+        // Lazy setup: converter + playerNode created on first packet batch.
+        if playerNode == nil, let format = audioFormat {
+            setupPlayerNodeIfNeeded(format)
+        }
+
+        guard let converter = audioConverter,
+              let outputFormat = pcmOutputFormat,
+              let playerNode else { return }
+
+        // Upper bound: 4096 is safe for MP3 (max ~1441 bytes), 2048 fallback is fine too.
+        let effectiveMaxPacketSize = maxPacketSize > 0 ? Int(maxPacketSize) : 4096
+
+        guard let compressedBuffer = AVAudioCompressedBuffer(
+            format: converter.inputFormat,
+            packetCapacity: AVAudioPacketCount(numberPackets),
+            maximumPacketSize: effectiveMaxPacketSize
+        ) else {
+            logger.error("talk player node: failed to allocate compressed buffer")
+            return
+        }
+
+        // Copy compressed bytes into the buffer.
+        compressedBuffer.byteLength = numberBytes
+        compressedBuffer.packetCount = numberPackets
+        memcpy(compressedBuffer.data, inputData, Int(numberBytes))
+
+        // Copy or synthesize packet descriptions.
+        if let dstDescs = compressedBuffer.packetDescriptions {
+            if let srcDescs = packetDescriptions {
+                // VBR: use the descriptions provided by AudioFileStream.
+                memcpy(dstDescs, srcDescs, Int(numberPackets) * MemoryLayout<AudioStreamPacketDescription>.size)
+            } else {
+                // CBR: all packets are equal-sized — synthesize descriptions.
+                let packetSize = Int(numberBytes) / Int(numberPackets)
+                for i in 0..<Int(numberPackets) {
+                    dstDescs[i] = AudioStreamPacketDescription(
+                        mStartOffset: Int64(i * packetSize),
+                        mVariableFramesInPacket: 0,
+                        mDataByteSize: UInt32(packetSize)
+                    )
+                }
+            }
+        }
+
+        // Allocate output buffer.  mFramesPerPacket is 1152 for standard MP3.
+        let rawFPP = converter.inputFormat.streamDescription.pointee.mFramesPerPacket
+        let framesPerPacket: AVAudioFrameCount = rawFPP > 0 ? AVAudioFrameCount(rawFPP) : 1152
+        let outputFrameCapacity = framesPerPacket * AVAudioFrameCount(numberPackets)
+
+        guard outputFrameCapacity > 0,
+              let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputFrameCapacity) else {
+            logger.error("talk player node: failed to allocate PCM output buffer")
+            return
+        }
+
+        // Decode.  We provide all input in one shot via the input block.
+        // The block signals .noDataNow on the second call to stop the converter loop.
+        var inputProvided = false
+        var conversionError: NSError?
+        let status = converter.convert(to: outputBuffer, error: &conversionError) { _, outStatus in
+            if !inputProvided {
+                inputProvided = true
+                outStatus.pointee = .haveData
+                return compressedBuffer
+            }
+            outStatus.pointee = .noDataNow
+            return nil
+        }
+
+        switch status {
+        case .error:
+            logger.error("talk player node: conversion failed: \(conversionError?.localizedDescription ?? "unknown", privacy: .public)")
+            return
+        case .haveData, .inputRanDry, .endOfStream:
+            break
+        @unknown default:
+            break
+        }
+
+        guard outputBuffer.frameLength > 0 else { return }
+
+        // Schedule on the player node.
+        lock.lock()
+        pendingNodeBuffers += 1
+        lock.unlock()
+
+        playerNode.scheduleBuffer(outputBuffer) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            // Guard against going negative if stop() raced and reset the counter.
+            if self.pendingNodeBuffers > 0 {
+                self.pendingNodeBuffers -= 1
+            }
+            let pending = self.pendingNodeBuffers
+            let done = self.inputFinished
+            self.lock.unlock()
+
+            if done, pending == 0 {
+                self.finish(StreamingPlaybackResult(finished: true, interruptedAt: nil))
+            }
+        }
+
+        // Start the player node on the first scheduled buffer.
+        if !playerNodeStarted {
+            playerNodeStarted = true
+            playerNode.play()
+        }
+    }
+
+    // MARK: — Timestamps
+
     private func currentTimeSeconds() -> Double? {
         guard let audioQueue, sampleRate > 0 else { return nil }
         var timeStamp = AudioTimeStamp()
@@ -366,6 +612,18 @@ final class StreamingAudioPlayback: @unchecked Sendable {
         if status != noErr { return nil }
         if timeStamp.mSampleTime.isNaN { return nil }
         return timeStamp.mSampleTime / sampleRate
+    }
+
+    /// Returns current playback position in seconds for an AVAudioPlayerNode.
+    /// Uses lastRenderTime (the most recent render cycle) as the reference point.
+    /// Returns nil if the node has not yet started rendering.
+    private func currentTimeSecondsForNode(_ node: AVAudioPlayerNode) -> Double? {
+        guard let lastRenderTime = node.lastRenderTime,
+              lastRenderTime.isSampleTimeValid,
+              let playerTime = node.playerTime(forNodeTime: lastRenderTime) else { return nil }
+        let outputSampleRate = node.outputFormat(forBus: 0).sampleRate
+        guard outputSampleRate > 0 else { return nil }
+        return Double(playerTime.sampleTime) / outputSampleRate
     }
 }
 

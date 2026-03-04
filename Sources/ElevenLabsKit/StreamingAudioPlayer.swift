@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import OSLog
 
@@ -24,11 +25,35 @@ public final class StreamingAudioPlayer: NSObject {
     private let logger = Logger(subsystem: "com.steipete.clawdis", category: "talk.tts.stream")
     private var playback: StreamingAudioPlayback?
 
+    /// Non-nil when routing through a shared AVAudioEngine (AEC path).
+    private let sharedEngine: AVAudioEngine?
+
+    /// Creates a player that owns its own AudioQueue (original behavior unchanged).
+    override public init() {
+        self.sharedEngine = nil
+        super.init()
+    }
+
+    /// Creates a player that routes audio through a shared AVAudioEngine.
+    ///
+    /// Use this when AEC (setVoiceProcessingEnabled) is required — AEC needs
+    /// both mic input and speaker output on the same engine instance.
+    /// The engine is never stopped by this player; the caller owns its lifecycle.
+    public init(sharedEngine: AVAudioEngine) {
+        self.sharedEngine = sharedEngine
+        super.init()
+    }
+
     /// Starts playing a streaming audio payload.
     public func play(stream: AsyncThrowingStream<Data, Error>) async -> StreamingPlaybackResult {
         stopInternal()
 
-        let playback = StreamingAudioPlayback(logger: logger)
+        let playback: StreamingAudioPlayback
+        if let sharedEngine {
+            playback = StreamingAudioPlayback(logger: logger, sharedEngine: sharedEngine)
+        } else {
+            playback = StreamingAudioPlayback(logger: logger)
+        }
         self.playback = playback
 
         return await withCheckedContinuation { continuation in

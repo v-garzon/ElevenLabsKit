@@ -13,6 +13,7 @@ public final class PCMStreamingAudioPlayer {
     private let engineFactory: () -> AVAudioEngine
     private let startEngine: (AVAudioEngine) throws -> Void
     private let stopEngine: (AVAudioEngine) -> Void
+    private let isSharedEngine: Bool
     private var engine: AVAudioEngine
     private var player: PCMPlayerNodeing
     private var format: AVAudioFormat?
@@ -20,15 +21,45 @@ public final class PCMStreamingAudioPlayer {
     private var inputFinished = false
     private var continuation: CheckedContinuation<StreamingPlaybackResult, Never>?
 
-    /// Creates a default PCM player.
+    /// Creates a default PCM player with its own private AVAudioEngine.
     public init() {
         self.playerFactory = { AVAudioPlayerNodeAdapter() }
         self.engineFactory = { AVAudioEngine() }
         self.startEngine = { engine in try engine.start() }
         self.stopEngine = { engine in engine.stop() }
+        self.isSharedEngine = false
         self.engine = engineFactory()
         self.player = playerFactory()
         player.attach(to: engine)
+    }
+
+    /// Creates a PCM player that routes audio through a shared AVAudioEngine.
+    ///
+    /// The engine is never stopped or recreated by this player — the caller
+    /// owns the engine lifecycle. Use this when AEC (setVoiceProcessingEnabled)
+    /// is required, since AEC needs both mic input and speaker output on the
+    /// same engine instance.
+    ///
+    /// The player node is attached to the engine once in this init and reused
+    /// across all play sessions. It is never detached during normal operation.
+    public init(sharedEngine: AVAudioEngine) {
+        self.playerFactory = { AVAudioPlayerNodeAdapter() }
+        self.engineFactory = { sharedEngine }
+        self.startEngine = { engine in
+            // Only start if not already running — caller may have started it
+            if !engine.isRunning {
+                try engine.start()
+            }
+        }
+        // Never stop the shared engine — the caller owns its lifecycle
+        self.stopEngine = { _ in }
+        self.isSharedEngine = true
+        self.engine = sharedEngine
+        self.player = AVAudioPlayerNodeAdapter()
+        // Attach the player node once — it stays attached for the lifetime
+        // of this instance. configure() reconnects it with the correct format
+        // before each play session.
+        player.attach(to: sharedEngine)
     }
 
     init(
@@ -41,6 +72,7 @@ public final class PCMStreamingAudioPlayer {
         self.engineFactory = engineFactory
         self.startEngine = startEngine
         self.stopEngine = stopEngine
+        self.isSharedEngine = false
         self.engine = engineFactory()
         self.player = playerFactory()
         player.attach(to: engine)
@@ -90,12 +122,26 @@ public final class PCMStreamingAudioPlayer {
     }
 
     private func configure(format: AVAudioFormat) {
-        if self.format?.sampleRate != format.sampleRate || self.format?.commonFormat != format.commonFormat {
-            stopEngine(engine)
-            engine = engineFactory()
-            player = playerFactory()
-            player.attach(to: engine)
+        let formatChanged = self.format?.sampleRate != format.sampleRate
+            || self.format?.commonFormat != format.commonFormat
+
+        if formatChanged {
+            if isSharedEngine {
+                // For shared engine: stop the current player node and reconnect
+                // with the new format. We never recreate the engine or the node —
+                // the same node (attached once in init) is reused.
+                // AVAudioEngine.connect handles format changes on an already-attached
+                // node gracefully by disconnecting and reconnecting.
+                player.stop()
+            } else {
+                // For private engine: full teardown and recreation, same as original.
+                stopEngine(engine)
+                engine = engineFactory()
+                player = playerFactory()
+                player.attach(to: engine)
+            }
         }
+
         self.format = format
         player.connect(to: engine, format: format)
     }
@@ -152,6 +198,8 @@ public final class PCMStreamingAudioPlayer {
 
     private func stopInternal() {
         player.stop()
+        // For shared engine: stopEngine is a no-op — engine stays running.
+        // For private engine: stopEngine stops it as before.
         stopEngine(engine)
         pendingBuffers = 0
         inputFinished = false
